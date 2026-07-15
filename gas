@@ -1,0 +1,1259 @@
+#!/usr/bin/env python3
+"""gas — Grok Account Switch (ccs-style multi-account CLI).
+
+Capture and swap Grok CLI OAuth sessions stored under GROK_HOME/auth.json
+(default ~/.grok/auth.json). Command surface mirrors `ccs`:
+
+  gas add / ls / sw / to / profile / rm / check / status / stats
+  gas exec / config-dir          # parallel isolation via GROK_HOME
+  gas -n sw                      # dry-run
+
+Store: ~/.grok-switch/  (GSS_HOME / GAS_HOME)
+Grok hot-reloads auth.json — usually no restart needed.
+
+Written by Grok 4.5 (high).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+__version__ = "0.1.0"
+
+HOME = Path.home()
+
+
+def _resolve_grok_dir() -> Path:
+    # Prefer gas test override, then official Grok env, then default.
+    if os.environ.get("GROK_DIR"):
+        return Path(os.environ["GROK_DIR"]).expanduser()
+    if os.environ.get("GROK_HOME"):
+        return Path(os.environ["GROK_HOME"]).expanduser()
+    return HOME / ".grok"
+
+
+def _resolve_switch_dir() -> Path:
+    if os.environ.get("GAS_HOME"):
+        return Path(os.environ["GAS_HOME"]).expanduser()
+    if os.environ.get("GSS_HOME"):
+        return Path(os.environ["GSS_HOME"]).expanduser()
+    return HOME / ".grok-switch"
+
+
+GROK_DIR = _resolve_grok_dir()
+AUTH_PATH = GROK_DIR / "auth.json"
+SWITCH_DIR = _resolve_switch_dir()
+ACCOUNTS_DIR = SWITCH_DIR / "accounts"
+SEQUENCE_PATH = SWITCH_DIR / "sequence.json"
+DIR_ACCOUNTS_PATH = SWITCH_DIR / "dir-accounts.json"
+LOCK_DIR = SWITCH_DIR / ".switch.lock"
+ISOLATED_DIR = SWITCH_DIR / "isolated"
+LEGACY_PROFILES_DIR = SWITCH_DIR / "profiles"
+LEGACY_STATE_PATH = SWITCH_DIR / "state.json"
+
+_SILENT_ENV = os.environ.get("GAS_SILENT", os.environ.get("CCS_SILENT", ""))
+SILENT = _SILENT_ENV in ("1", "true", "yes")
+
+if sys.stdout.isatty() and not os.environ.get("NO_COLOR") and not SILENT:
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+    CYAN = "\033[36m"
+    RESET = "\033[0m"
+else:
+    BOLD = DIM = GREEN = YELLOW = RED = CYAN = RESET = ""
+
+DRY_RUN = False
+
+
+# ── output helpers ──────────────────────────────────────────────────────────
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"{RED}error:{RESET} {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def info(msg: str = "") -> None:
+    if not SILENT:
+        print(msg)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def now_ts() -> float:
+    return time.time()
+
+
+def write_json(path: Path, data: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def read_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        die(f"invalid JSON in {path}: {e}")
+    if not isinstance(data, dict):
+        die(f"expected object in {path}")
+    return data
+
+
+def ensure_layout() -> None:
+    ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(SWITCH_DIR, 0o700)
+        os.chmod(ACCOUNTS_DIR, 0o700)
+    except OSError:
+        pass
+    migrate_v1_if_needed()
+    if not SEQUENCE_PATH.exists():
+        write_json(
+            SEQUENCE_PATH,
+            {
+                "version": 2,
+                "activeAccountNumber": None,
+                "lastUpdated": now_iso(),
+                "sequence": [],
+                "accounts": {},
+            },
+        )
+
+
+def empty_sequence() -> dict:
+    return {
+        "version": 2,
+        "activeAccountNumber": None,
+        "lastUpdated": now_iso(),
+        "sequence": [],
+        "accounts": {},
+    }
+
+
+def read_sequence() -> dict:
+    if not SEQUENCE_PATH.exists():
+        return empty_sequence()
+    data = read_json(SEQUENCE_PATH)
+    data.setdefault("version", 2)
+    data.setdefault("activeAccountNumber", None)
+    data.setdefault("sequence", [])
+    data.setdefault("accounts", {})
+    if not isinstance(data["accounts"], dict):
+        data["accounts"] = {}
+    if not isinstance(data["sequence"], list):
+        data["sequence"] = []
+    return data
+
+
+def write_sequence(seq: dict) -> None:
+    seq["lastUpdated"] = now_iso()
+    seq["version"] = 2
+    write_json(SEQUENCE_PATH, seq)
+
+
+def account_dir(num: int | str) -> Path:
+    return ACCOUNTS_DIR / str(num)
+
+
+def account_auth_path(num: int | str) -> Path:
+    return account_dir(num) / "auth.json"
+
+
+def account_meta_path(num: int | str) -> Path:
+    return account_dir(num) / "meta.json"
+
+
+def load_active_auth() -> dict:
+    if not AUTH_PATH.exists():
+        return {}
+    return read_json(AUTH_PATH)
+
+
+def auth_identity(auth: dict) -> dict:
+    empty = {"email": None, "name": None, "user_id": None, "expires_at": None}
+    if not auth:
+        return empty
+    entry = next(iter(auth.values()), {})
+    if not isinstance(entry, dict):
+        return empty
+    first = (entry.get("first_name") or "").strip()
+    last = (entry.get("last_name") or "").strip()
+    name = f"{first} {last}".strip() or None
+    return {
+        "email": entry.get("email"),
+        "name": name,
+        "user_id": entry.get("user_id") or entry.get("principal_id"),
+        "expires_at": entry.get("expires_at"),
+    }
+
+
+def get_current_email() -> str | None:
+    return auth_identity(load_active_auth()).get("email")
+
+
+def format_ident(ident: dict) -> str:
+    email = ident.get("email")
+    if not email:
+        return f"{DIM}(not logged in){RESET}"
+    name = ident.get("name")
+    if name:
+        return f"{email}  {DIM}({name}){RESET}"
+    return str(email)
+
+
+def valid_profile_name(name: str) -> str:
+    name = name.strip()
+    if not name:
+        die("profile name is empty")
+    if name in (".", "..") or "/" in name or "\\" in name or name.startswith("."):
+        die(f"invalid profile name: {name!r}")
+    if not all(c.isalnum() or c in "-_." for c in name):
+        die(f"profile name may only contain letters, digits, -, _, .: {name!r}")
+    if len(name) > 64:
+        die("profile name too long (max 64)")
+    if name.isdigit():
+        die("profile name must not be purely numeric (conflicts with account numbers)")
+    return name
+
+
+def safe_email_slug(email: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._+-]+", "_", email)[:80] or "account"
+
+
+# ── switch lock (ccs 0.4-style mkdir lock) ──────────────────────────────────
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+    except SystemError:
+        return False
+
+
+def acquire_switch_lock(timeout_s: float | None = None) -> None:
+    """Exclusive lock for credential switches. mkdir is atomic; steals dead owners."""
+    if timeout_s is None:
+        try:
+            timeout_s = float(os.environ.get("GAS_LOCK_TIMEOUT_SECS", "10"))
+        except ValueError:
+            timeout_s = 10.0
+    SWITCH_DIR.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + timeout_s
+    while True:
+        try:
+            LOCK_DIR.mkdir(exist_ok=False)
+            try:
+                (LOCK_DIR / "pid").write_text(str(os.getpid()), encoding="utf-8")
+            except OSError:
+                pass
+            return
+        except FileExistsError:
+            owner = None
+            pid_file = LOCK_DIR / "pid"
+            if pid_file.exists():
+                try:
+                    owner = int(pid_file.read_text(encoding="utf-8").strip())
+                except (ValueError, OSError):
+                    owner = None
+            if owner is not None and not _pid_alive(owner):
+                shutil.rmtree(LOCK_DIR, ignore_errors=True)
+                continue
+            if time.time() >= deadline:
+                die("another account switch is in progress (could not acquire lock)")
+            time.sleep(0.2)
+
+
+def release_switch_lock() -> None:
+    shutil.rmtree(LOCK_DIR, ignore_errors=True)
+
+
+# ── migration from v1 named profiles ────────────────────────────────────────
+
+
+def migrate_v1_if_needed() -> None:
+    if SEQUENCE_PATH.exists():
+        return
+    if not LEGACY_PROFILES_DIR.exists():
+        return
+    profiles = sorted(
+        p for p in LEGACY_PROFILES_DIR.iterdir() if p.is_dir() and (p / "auth.json").exists()
+    )
+    if not profiles:
+        return
+
+    seq = empty_sequence()
+    legacy_state = read_json(LEGACY_STATE_PATH) if LEGACY_STATE_PATH.exists() else {}
+    legacy_current = legacy_state.get("current")
+    active_num = None
+    live_email = get_current_email()
+
+    for i, pdir in enumerate(profiles, start=1):
+        auth = read_json(pdir / "auth.json")
+        meta = read_json(pdir / "meta.json") if (pdir / "meta.json").exists() else {}
+        ident = auth_identity(auth)
+        email = ident.get("email") or meta.get("email") or f"account-{i}"
+        account_dir(i).mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(account_dir(i), 0o700)
+        except OSError:
+            pass
+        write_json(account_auth_path(i), auth)
+        write_json(
+            account_meta_path(i),
+            {**ident, "profile": pdir.name, "migrated_from": pdir.name},
+        )
+        seq["accounts"][str(i)] = {
+            "email": email,
+            "user_id": ident.get("user_id"),
+            "display_name": ident.get("name"),
+            "profile": pdir.name,
+            "added": meta.get("saved_at") or now_iso(),
+            "lastUsed": meta.get("last_used_at"),
+            "switchCount": 0,
+            "totalSeconds": 0,
+            "_session_start": None,
+        }
+        seq["sequence"].append(i)
+        if legacy_current and pdir.name == legacy_current:
+            active_num = i
+        if live_email and email == live_email:
+            active_num = i
+
+    seq["activeAccountNumber"] = active_num
+    write_sequence(seq)
+    info(f"{DIM}migrated {len(profiles)} legacy profile(s) → numbered accounts{RESET}")
+
+
+# ── resolve identifiers ─────────────────────────────────────────────────────
+
+
+def resolve_account_identifier(identifier: str, seq: dict | None = None) -> int | None:
+    seq = seq or read_sequence()
+    ident = identifier.strip()
+    if not ident:
+        return None
+    if ident.isdigit():
+        num = int(ident)
+        return num if str(num) in seq["accounts"] else None
+    for key, acc in seq["accounts"].items():
+        if (acc.get("email") or "").lower() == ident.lower():
+            return int(key)
+    for key, acc in seq["accounts"].items():
+        if acc.get("profile") and acc["profile"] == ident:
+            return int(key)
+    return None
+
+
+def next_account_number(seq: dict) -> int:
+    if not seq["accounts"]:
+        return 1
+    nums = [int(k) for k in seq["accounts"].keys() if str(k).isdigit()]
+    return (max(nums) if nums else 0) + 1
+
+
+def account_exists_email(email: str, seq: dict) -> int | None:
+    for key, acc in seq["accounts"].items():
+        if (acc.get("email") or "").lower() == email.lower():
+            return int(key)
+    return None
+
+
+# ── transactional switch ────────────────────────────────────────────────────
+
+
+def _session_seconds(acc: dict) -> int:
+    start = acc.get("_session_start")
+    if not start:
+        return 0
+    try:
+        return max(0, int(now_ts() - float(start)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def perform_switch(target_num: int) -> None:
+    """ccs 0.4-style: lock → recalibrate by live email → backup → restore → stats."""
+    ensure_layout()
+    seq = read_sequence()
+    target_key = str(target_num)
+    if target_key not in seq["accounts"]:
+        die(f"Account-{target_num} does not exist")
+
+    target_acc = seq["accounts"][target_key]
+    target_email = target_acc.get("email") or "?"
+    live_email = get_current_email()
+    current_num = seq.get("activeAccountNumber")
+
+    if DRY_RUN:
+        info(
+            f"[DRY RUN] Would switch from Account-{current_num} ({live_email or 'none'}) "
+            f"to Account-{target_num} ({target_email})"
+        )
+        info("[DRY RUN] Steps:")
+        info("  1. Acquire switch lock")
+        info("  2. Backup current live auth into its managed slot (by email)")
+        info(f"  3. Restore auth from Account-{target_num} into {AUTH_PATH}")
+        info("  4. Update sequence.json (active, stats)")
+        info("  5. Release lock")
+        return
+
+    acquire_switch_lock()
+    try:
+        # Re-read under lock (another switch may have landed)
+        seq = read_sequence()
+        if target_key not in seq["accounts"]:
+            die(f"Account-{target_num} does not exist")
+        target_acc = seq["accounts"][target_key]
+        target_email = target_acc.get("email") or "?"
+        live_email = get_current_email()
+        current_num = seq.get("activeAccountNumber")
+
+        # Live email is SSOT for which credential is actually active
+        if live_email:
+            real = account_exists_email(live_email, seq)
+            if real is None:
+                die(
+                    f"the active account ({live_email}) is not managed by gas.\n"
+                    f"  Run {CYAN}gas add{RESET} before switching so its credentials aren't lost."
+                )
+            if current_num is not None and int(current_num) != int(real):
+                info(
+                    f"{DIM}note: corrected active account {current_num} → {real} "
+                    f"(sequence was out of sync){RESET}"
+                )
+            current_num = real
+
+        # No-op if already on target
+        if current_num is not None and int(current_num) == int(target_num):
+            auth = load_active_auth()
+            if auth:
+                write_json(account_auth_path(target_num), auth)
+            info(f"Already on Account-{target_num} ({target_email})")
+            return
+
+        rollback_auth_raw = AUTH_PATH.read_text(encoding="utf-8") if AUTH_PATH.exists() else None
+        rollback_seq = json.loads(json.dumps(seq))
+
+        def rollback(reason: str) -> None:
+            if not SILENT:
+                print(f"\n{RED}error:{RESET} switch failed: {reason}")
+                print("Rolling back…")
+            try:
+                if rollback_auth_raw is not None:
+                    AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    AUTH_PATH.write_text(rollback_auth_raw, encoding="utf-8")
+                    os.chmod(AUTH_PATH, 0o600)
+                elif AUTH_PATH.exists():
+                    AUTH_PATH.unlink()
+                write_sequence(rollback_seq)
+            except OSError as e:
+                print(f"{RED}rollback partially failed:{RESET} {e}", file=sys.stderr)
+            if not SILENT:
+                print(
+                    f"Rollback complete. Account-{rollback_seq.get('activeAccountNumber')} still active."
+                )
+            raise SystemExit(1)
+
+        # Step 1: backup live into its managed slot
+        if current_num is not None and str(current_num) in seq["accounts"]:
+            live = load_active_auth()
+            if live:
+                try:
+                    write_json(account_auth_path(current_num), live)
+                    cur = seq["accounts"][str(current_num)]
+                    cur["totalSeconds"] = int(cur.get("totalSeconds") or 0) + _session_seconds(cur)
+                    cur["_session_start"] = None
+                    ident = auth_identity(live)
+                    if ident.get("email"):
+                        cur["email"] = ident["email"]
+                    if ident.get("name"):
+                        cur["display_name"] = ident["name"]
+                    if ident.get("user_id"):
+                        cur["user_id"] = ident["user_id"]
+                except OSError as e:
+                    rollback(f"failed to backup current account: {e}")
+
+        # Step 2: load target
+        if not account_auth_path(target_num).exists():
+            rollback(f"missing auth backup for Account-{target_num}")
+        try:
+            target_auth = read_json(account_auth_path(target_num))
+        except SystemExit:
+            raise
+        except Exception as e:  # noqa: BLE001
+            rollback(f"cannot read target auth: {e}")
+        if not target_auth:
+            rollback(f"empty auth backup for Account-{target_num}")
+
+        # Step 3: write live
+        try:
+            GROK_DIR.mkdir(parents=True, exist_ok=True)
+            write_json(AUTH_PATH, target_auth)
+        except OSError as e:
+            rollback(f"failed to write live auth: {e}")
+
+        # Step 4: sequence
+        try:
+            seq["activeAccountNumber"] = int(target_num)
+            t = seq["accounts"][target_key]
+            t["switchCount"] = int(t.get("switchCount") or 0) + 1
+            t["lastUsed"] = now_iso()
+            t["_session_start"] = now_ts()
+            write_sequence(seq)
+        except Exception as e:  # noqa: BLE001
+            rollback(f"failed to update sequence: {e}")
+
+        ident = auth_identity(target_auth)
+        profile = target_acc.get("profile")
+        prof = f" [{profile}]" if profile else ""
+        info(f"{GREEN}✓{RESET} switched to Account-{target_num}{prof}: {format_ident(ident)}")
+        info(f"  {DIM}Grok hot-reloads auth.json — next request uses this account{RESET}")
+    finally:
+        release_switch_lock()
+
+
+# ── isolation via GROK_HOME ─────────────────────────────────────────────────
+
+
+def materialize_account_home(num: int, dest: Path | None = None) -> Path:
+    """Write account auth into an isolated GROK_HOME directory."""
+    ensure_layout()
+    seq = read_sequence()
+    if str(num) not in seq["accounts"]:
+        die(f"Account-{num} does not exist")
+    email = seq["accounts"][str(num)].get("email") or f"account-{num}"
+    if dest is None:
+        dest = ISOLATED_DIR / f"{num}-{safe_email_slug(email)}"
+    dest = Path(dest).expanduser().resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(dest, 0o700)
+    except OSError:
+        pass
+
+    # Prefer live auth when it matches this account (freshest tokens)
+    live = load_active_auth()
+    live_email = auth_identity(live).get("email")
+    if live and live_email and live_email.lower() == email.lower():
+        auth = live
+    else:
+        if not account_auth_path(num).exists():
+            die(f"missing auth backup for Account-{num}")
+        auth = read_json(account_auth_path(num))
+        if not auth:
+            die(f"empty auth backup for Account-{num}")
+
+    write_json(dest / "auth.json", auth)
+    return dest
+
+
+# ── commands ────────────────────────────────────────────────────────────────
+
+
+def cmd_add(_: argparse.Namespace) -> None:
+    """Capture current live login (does NOT logout)."""
+    ensure_layout()
+    auth = load_active_auth()
+    ident = auth_identity(auth)
+    email = ident.get("email")
+    if not email:
+        die(f"no active Grok login at {AUTH_PATH}. Run: grok login")
+
+    seq = read_sequence()
+    existing = account_exists_email(email, seq)
+
+    if existing is not None:
+        write_json(account_auth_path(existing), auth)
+        acc = seq["accounts"][str(existing)]
+        acc["email"] = email
+        if ident.get("name"):
+            acc["display_name"] = ident["name"]
+        if ident.get("user_id"):
+            acc["user_id"] = ident["user_id"]
+        acc["lastUsed"] = now_iso()
+        acc["_session_start"] = now_ts()
+        seq["activeAccountNumber"] = existing
+        write_sequence(seq)
+        info(f"{GREEN}✓{RESET} updated Account-{existing}: {format_ident(ident)}")
+        info(f"  {DIM}(already managed — refreshed credentials){RESET}")
+        return
+
+    num = next_account_number(seq)
+    account_dir(num).mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(account_dir(num), 0o700)
+    except OSError:
+        pass
+    write_json(account_auth_path(num), auth)
+    write_json(account_meta_path(num), {**ident, "added": now_iso()})
+
+    seq["accounts"][str(num)] = {
+        "email": email,
+        "user_id": ident.get("user_id"),
+        "display_name": ident.get("name"),
+        "profile": None,
+        "added": now_iso(),
+        "lastUsed": now_iso(),
+        "switchCount": 0,
+        "totalSeconds": 0,
+        "_session_start": now_ts(),
+    }
+    seq["sequence"].append(num)
+    seq["activeAccountNumber"] = num
+    write_sequence(seq)
+
+    info(f"{GREEN}✓{RESET} added Account-{num}: {format_ident(ident)}")
+    info(f"  Tip: log into another account with {CYAN}grok login{RESET}, then {CYAN}gas add{RESET} again")
+    info(f"       switch with {CYAN}gas sw{RESET} or {CYAN}gas to {num}{RESET}")
+
+
+def cmd_ls(_: argparse.Namespace) -> None:
+    ensure_layout()
+    seq = read_sequence()
+    live_email = get_current_email()
+
+    if not seq["accounts"]:
+        info("No accounts are managed yet.")
+        if live_email:
+            if sys.stdin.isatty() and not SILENT:
+                ans = input(
+                    f"Add current account ({live_email}) to managed list? [Y/n] "
+                ).strip().lower()
+                if ans in ("", "y", "yes"):
+                    cmd_add(argparse.Namespace())
+                    return
+            else:
+                info(f"  Active login: {live_email}")
+                info(f"  Run: {CYAN}gas add{RESET}")
+        return
+
+    active_num = account_exists_email(live_email, seq) if live_email else None
+    if active_num is None:
+        active_num = seq.get("activeAccountNumber")
+
+    info(f"{BOLD}Accounts{RESET}  {DIM}({SWITCH_DIR}){RESET}")
+    for num in seq.get("sequence") or sorted(int(k) for k in seq["accounts"]):
+        acc = seq["accounts"].get(str(num))
+        if not acc:
+            continue
+        email = acc.get("email") or "?"
+        prof = acc.get("profile")
+        prof_s = f" [{prof}]" if prof else ""
+        mark = (
+            f" {GREEN}(active){RESET}"
+            if active_num is not None and int(num) == int(active_num)
+            else ""
+        )
+        info(f"  {num}: {email}{prof_s}{mark}")
+
+    if live_email and account_exists_email(live_email, seq) is None:
+        info(
+            f"\n  {YELLOW}notice:{RESET} live login {live_email} is not managed — "
+            f"run {CYAN}gas add{RESET}"
+        )
+
+
+def cmd_sw(_: argparse.Namespace) -> None:
+    ensure_layout()
+    seq = read_sequence()
+    if not seq["sequence"]:
+        die("no accounts managed yet. Run: gas add")
+
+    live_email = get_current_email()
+    if not live_email:
+        die("no active Grok login. Run: grok login && gas add")
+
+    # Auto-capture unmanaged live once (ccs 0.2 UX), then ask to re-run
+    if account_exists_email(live_email, seq) is None:
+        info(f"Notice: active account '{live_email}' was not managed.")
+        cmd_add(argparse.Namespace())
+        info("It has been added. Run `gas sw` again to rotate to the next account.")
+        return
+
+    seq = read_sequence()
+    active = account_exists_email(live_email, seq)
+    if active is None:
+        active = seq.get("activeAccountNumber")
+
+    sequence = [int(x) for x in seq["sequence"]]
+    if not sequence:
+        die("empty sequence")
+
+    if active is None or int(active) not in sequence:
+        next_num = sequence[0]
+    else:
+        idx = sequence.index(int(active))
+        next_num = sequence[(idx + 1) % len(sequence)]
+
+    perform_switch(next_num)
+
+
+def cmd_to(args: argparse.Namespace) -> None:
+    ensure_layout()
+    seq = read_sequence()
+    if not seq["accounts"]:
+        die("no accounts managed yet. Run: gas add")
+    target = resolve_account_identifier(args.identifier, seq)
+    if target is None:
+        die(f"no account found matching: {args.identifier}")
+    perform_switch(target)
+
+
+def cmd_profile(args: argparse.Namespace) -> None:
+    ensure_layout()
+    seq = read_sequence()
+    num = resolve_account_identifier(args.identifier, seq)
+    if num is None:
+        die(f"account '{args.identifier}' not found")
+    name = valid_profile_name(args.name)
+    for key, acc in seq["accounts"].items():
+        if acc.get("profile") == name and int(key) != int(num):
+            die(f"profile name {name!r} already used by Account-{key}")
+    seq["accounts"][str(num)]["profile"] = name
+    write_sequence(seq)
+    email = seq["accounts"][str(num)].get("email")
+    info(f"{GREEN}✓{RESET} set profile for Account-{num} ({email}): {BOLD}{name}{RESET}")
+
+
+def cmd_rm(args: argparse.Namespace) -> None:
+    ensure_layout()
+    seq = read_sequence()
+    num = resolve_account_identifier(args.identifier, seq)
+    if num is None:
+        die(f"account '{args.identifier}' not found")
+
+    acc = seq["accounts"][str(num)]
+    email = acc.get("email") or "?"
+    active = seq.get("activeAccountNumber")
+    if active is not None and int(active) == int(num):
+        info(f"{YELLOW}warning:{RESET} Account-{num} ({email}) is currently active")
+
+    if not args.yes:
+        if not sys.stdin.isatty() or SILENT:
+            die("refusing to remove without -y in non-interactive mode")
+        confirm = input(f"Permanently remove Account-{num} ({email})? [y/N] ").strip().lower()
+        if confirm not in ("y", "yes"):
+            info("cancelled")
+            return
+
+    shutil.rmtree(account_dir(num), ignore_errors=True)
+    del seq["accounts"][str(num)]
+    seq["sequence"] = [x for x in seq["sequence"] if int(x) != int(num)]
+    if seq.get("activeAccountNumber") is not None and int(seq["activeAccountNumber"]) == int(num):
+        seq["activeAccountNumber"] = None
+    write_sequence(seq)
+    info(f"{GREEN}✓{RESET} removed Account-{num} ({email})")
+    info(f"  {DIM}live {AUTH_PATH} was not deleted{RESET}")
+
+
+def cmd_status(_: argparse.Namespace) -> None:
+    ensure_layout()
+    seq = read_sequence()
+    live = auth_identity(load_active_auth())
+    email = live.get("email")
+    active_num = account_exists_email(email, seq) if email else None
+    if active_num is None:
+        active_num = seq.get("activeAccountNumber")
+
+    info(f"{BOLD}Account Status{RESET}")
+    info("==============")
+    info()
+    info(f"Current account: {email or '(not logged in)'}")
+    if active_num is not None and str(active_num) in seq["accounts"]:
+        info(f"Account number:  {active_num}")
+        prof = seq["accounts"][str(active_num)].get("profile")
+        if prof:
+            info(f"Profile name:    {prof}")
+        if live.get("name"):
+            info(f"Display name:    {live['name']}")
+    elif email:
+        info(f"Account number:  {YELLOW}(unmanaged — run gas add){RESET}")
+    if seq.get("lastUpdated"):
+        info(f"Last switch:     {seq['lastUpdated']}")
+
+    info()
+    exp = live.get("expires_at")
+    if exp:
+        status = _format_expiry(exp)
+        info(f"Token status:    {status}")
+        if "EXPIRED" in status:
+            info(f"  {YELLOW}hint:{RESET} re-login with {CYAN}grok login{RESET}, then {CYAN}gas add{RESET}")
+    elif email:
+        info("Token status:    no expires_at in auth.json")
+    else:
+        info("Token status:    no credentials")
+
+
+def _format_expiry(expires_at: str) -> str:
+    try:
+        s = expires_at.replace("Z", "+00:00")
+        exp_dt = datetime.fromisoformat(s)
+        if exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        diff = int((exp_dt - now).total_seconds())
+        if diff <= 0:
+            return f"EXPIRED ({-diff // 3600}h ago)"
+        if diff < 3600:
+            return f"Expires in {diff // 60} minutes"
+        if diff < 86400:
+            return f"Expires in {diff // 3600} hours"
+        return f"Expires in {diff // 86400} days"
+    except (ValueError, TypeError):
+        return str(expires_at)
+
+
+def cmd_stats(_: argparse.Namespace) -> None:
+    ensure_layout()
+    seq = read_sequence()
+    if not seq["accounts"]:
+        info("No accounts are managed yet.")
+        return
+
+    info(f"{BOLD}Usage Statistics{RESET}")
+    info("================")
+    info()
+    info(f"{'Acct':<6} {'Email':<28} {'Switches':<9} {'Total Time':<14} Last Used")
+    info(f"{'----':<6} {'-----':<28} {'--------':<9} {'----------':<14} ---------")
+
+    for num in seq.get("sequence") or sorted(int(k) for k in seq["accounts"]):
+        acc = seq["accounts"].get(str(num))
+        if not acc:
+            continue
+        email = acc.get("email") or "?"
+        if len(email) > 26:
+            email = email[:23] + "..."
+        switches = int(acc.get("switchCount") or 0)
+        total = int(acc.get("totalSeconds") or 0) + _session_seconds(acc)
+        if total == 0:
+            time_str = "-"
+        elif total < 3600:
+            time_str = f"{total}s"
+        elif total < 86400:
+            time_str = f"{total // 3600}h {total % 3600 // 60}m"
+        else:
+            time_str = f"{total // 86400}d {total % 86400 // 3600}h"
+        last = acc.get("lastUsed") or "never"
+        if last != "never" and len(str(last)) > 16:
+            last = str(last)[:16]
+        info(f"{num:<6} {email:<28} {switches:<9} {time_str:<14} {last}")
+
+
+def cmd_check(_: argparse.Namespace) -> None:
+    ensure_layout()
+    seq = read_sequence()
+    if not seq["accounts"]:
+        info("No accounts are managed yet. Nothing to check.")
+        return
+
+    issues = 0
+    info(f"{BOLD}Backup Integrity Check{RESET}")
+    info("======================")
+    info()
+
+    if SEQUENCE_PATH.exists():
+        try:
+            json.loads(SEQUENCE_PATH.read_text(encoding="utf-8"))
+            info("[OK] sequence.json is valid JSON")
+        except json.JSONDecodeError:
+            info("[FAIL] sequence.json is invalid JSON")
+            issues += 1
+    else:
+        info("[FAIL] sequence.json missing")
+        issues += 1
+
+    for num in seq.get("sequence") or sorted(int(k) for k in seq["accounts"]):
+        acc = seq["accounts"].get(str(num), {})
+        email = acc.get("email") or "?"
+        info()
+        info(f"Account-{num} ({email}):")
+        ap = account_auth_path(num)
+        if ap.exists():
+            try:
+                data = json.loads(ap.read_text(encoding="utf-8"))
+                if not isinstance(data, dict) or not data:
+                    info("  [FAIL] auth backup empty or not an object")
+                    issues += 1
+                else:
+                    info("  [OK] auth backup is valid JSON")
+                    ident = auth_identity(data)
+                    if ident.get("email") and email != "?" and ident["email"] != email:
+                        info(
+                            f"  [WARN] email mismatch: sequence={email} auth={ident['email']}"
+                        )
+                        issues += 1
+            except json.JSONDecodeError:
+                info("  [FAIL] auth backup is invalid JSON")
+                issues += 1
+            mode = oct(ap.stat().st_mode & 0o777)
+            if mode == "0o600":
+                info("  [OK] auth file permissions: 600")
+            else:
+                info(f"  [WARN] auth file permissions: {mode[2:]} (expected 600)")
+                issues += 1
+        else:
+            info(f"  [FAIL] auth backup missing: {ap}")
+            issues += 1
+
+    info()
+    try:
+        dmode = oct(SWITCH_DIR.stat().st_mode & 0o777)
+        if dmode == "0o700":
+            info("[OK] switch directory permissions: 700")
+        else:
+            info(f"[WARN] switch directory permissions: {dmode[2:]} (expected 700)")
+            issues += 1
+    except OSError:
+        pass
+
+    info()
+    if AUTH_PATH.exists():
+        try:
+            json.loads(AUTH_PATH.read_text(encoding="utf-8"))
+            info("[OK] live auth.json is valid JSON")
+        except json.JSONDecodeError:
+            info("[FAIL] live auth.json is invalid JSON")
+            issues += 1
+    else:
+        info("[WARN] live auth.json missing (not logged in)")
+
+    info()
+    if issues == 0:
+        info("All checks passed.")
+    else:
+        info(f"{issues} issue(s) found.")
+        raise SystemExit(1)
+
+
+def cmd_dir(args: argparse.Namespace) -> None:
+    ensure_layout()
+    seq = read_sequence()
+    if not seq["accounts"]:
+        die("no accounts managed yet. Run: gas add")
+
+    parts: list[str] = list(args.parts or [])
+    if len(parts) == 1:
+        dir_path = Path.cwd().resolve()
+        account_id = parts[0]
+    elif len(parts) >= 2:
+        dir_path = Path(parts[0]).expanduser().resolve()
+        account_id = parts[1]
+    else:
+        die("usage: gas dir [directory] <num|email|profile>")
+
+    if not dir_path.is_dir():
+        die(f"directory does not exist: {dir_path}")
+
+    num = resolve_account_identifier(account_id, seq)
+    if num is None:
+        die(f"account '{account_id}' not found")
+
+    mapping = read_json(DIR_ACCOUNTS_PATH) if DIR_ACCOUNTS_PATH.exists() else {}
+    mapping.setdefault("dirs", {})
+    mapping["dirs"][str(dir_path)] = int(num)
+    write_json(DIR_ACCOUNTS_PATH, mapping)
+    email = seq["accounts"][str(num)].get("email")
+    info(f"{GREEN}✓{RESET} mapped {dir_path} → Account-{num} ({email})")
+
+
+def cmd_auto(_: argparse.Namespace) -> None:
+    ensure_layout()
+    if not DIR_ACCOUNTS_PATH.exists():
+        die("no directory mappings. Run: gas dir <path> <account>")
+
+    mapping = read_json(DIR_ACCOUNTS_PATH)
+    dirs: dict = mapping.get("dirs") or {}
+    cwd = Path.cwd().resolve()
+
+    best = None
+    best_len = -1
+    for d, num in dirs.items():
+        try:
+            base = Path(d).resolve()
+        except OSError:
+            continue
+        try:
+            cwd.relative_to(base)
+            n = len(base.parts)
+            if n > best_len:
+                best_len = n
+                best = int(num)
+        except ValueError:
+            continue
+
+    if best is None:
+        die(f"no account mapping for {cwd}")
+    perform_switch(best)
+
+
+def cmd_config_dir(args: argparse.Namespace) -> None:
+    """Materialize isolated GROK_HOME for an account and print export line."""
+    ensure_layout()
+    seq = read_sequence()
+    num = resolve_account_identifier(args.identifier, seq)
+    if num is None:
+        die(f"account '{args.identifier}' not found")
+    dest = Path(args.dest).expanduser() if args.dest else None
+    home = materialize_account_home(num, dest)
+    email = seq["accounts"][str(num)].get("email")
+    info(f"{GREEN}✓{RESET} Account-{num} ({email}) → {home}")
+    # Always print machine-readable export last (for eval)
+    print(f'export GROK_HOME="{home}"')
+
+
+def cmd_exec(args: argparse.Namespace) -> None:
+    """Run a command with GROK_HOME pointed at an isolated account dir."""
+    ensure_layout()
+    seq = read_sequence()
+    num = resolve_account_identifier(args.identifier, seq)
+    if num is None:
+        die(f"account '{args.identifier}' not found")
+
+    cmd = list(args.command or [])
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        die("usage: gas exec <account> [--dir PATH] -- <command> [args...]")
+
+    dest = Path(args.dest).expanduser() if args.dest else None
+    if DRY_RUN:
+        email = seq["accounts"][str(num)].get("email")
+        info(f"[DRY RUN] Would materialize Account-{num} ({email}) and run: {' '.join(cmd)}")
+        return
+
+    home = materialize_account_home(num, dest)
+    env = os.environ.copy()
+    env["GROK_HOME"] = str(home)
+    # Avoid gas test override leaking into child
+    env.pop("GROK_DIR", None)
+    if not SILENT:
+        print(f"{DIM}GROK_HOME={home}{RESET}", file=sys.stderr)
+    try:
+        raise SystemExit(subprocess.call(cmd, env=env))
+    except FileNotFoundError:
+        die(f"command not found: {cmd[0]}")
+
+
+def cmd_whoami(_: argparse.Namespace) -> None:
+    ensure_layout()
+    email = get_current_email()
+    if not email:
+        print("not logged in")
+        raise SystemExit(1)
+    print(email)
+
+
+def cmd_version(_: argparse.Namespace) -> None:
+    print(f"gas {__version__}")
+
+
+def cmd_help(parser: argparse.ArgumentParser) -> None:
+    parser.print_help()
+
+
+# ── legacy aliases ──────────────────────────────────────────────────────────
+
+
+def cmd_save_legacy(args: argparse.Namespace) -> None:
+    ensure_layout()
+    cmd_add(argparse.Namespace())
+    if args.name:
+        seq = read_sequence()
+        num = seq.get("activeAccountNumber")
+        if num is None:
+            return
+        name = valid_profile_name(args.name)
+        for key, acc in seq["accounts"].items():
+            if acc.get("profile") == name and int(key) != int(num):
+                die(f"profile name {name!r} already used by Account-{key}")
+        seq["accounts"][str(num)]["profile"] = name
+        write_sequence(seq)
+        info(f"  profile: {name}")
+
+
+def cmd_use_legacy(args: argparse.Namespace) -> None:
+    cmd_to(argparse.Namespace(identifier=args.name))
+
+
+def cmd_rename_legacy(args: argparse.Namespace) -> None:
+    ensure_layout()
+    seq = read_sequence()
+    num = resolve_account_identifier(args.old, seq)
+    if num is None:
+        die(f"account '{args.old}' not found")
+    name = valid_profile_name(args.new)
+    for key, acc in seq["accounts"].items():
+        if acc.get("profile") == name and int(key) != int(num):
+            die(f"profile name {name!r} already used by Account-{key}")
+    seq["accounts"][str(num)]["profile"] = name
+    write_sequence(seq)
+    info(f"{GREEN}✓{RESET} Account-{num} profile → {name}")
+
+
+# ── parser / main ───────────────────────────────────────────────────────────
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="gas",
+        description="Multi-Account Switcher for Grok CLI (ccs-style)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  gas add                         # capture current login
+  gas ls / gas sw / gas to 2
+  gas -n sw                       # dry-run
+  gas profile 1 work
+  gas dir ~/proj 1 && gas auto
+  gas exec 2 -- grok -p "hi"      # isolated via GROK_HOME
+  gas config-dir 2                # print export GROK_HOME=...
+  gas check / status / stats
+
+  # second account:
+  gas add && grok logout && grok login && gas add && gas sw
+
+environment:
+  GSS_HOME / GAS_HOME   store dir (default ~/.grok-switch)
+  GROK_HOME / GROK_DIR  live Grok config (default ~/.grok)
+  GAS_SILENT=1          quiet mode (for scripts)
+  NO_COLOR              disable colors
+""",
+    )
+    p.add_argument("-V", "--version", action="version", version=f"gas {__version__}")
+    p.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="show what would happen without making changes",
+    )
+
+    sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("add", help="add/update current login as managed account")
+    sub.add_parser("ls", aliases=["list"], help="list managed accounts")
+    sub.add_parser("sw", help="rotate to next account in sequence")
+    sp = sub.add_parser("to", help="switch to account by number, email, or profile")
+    sp.add_argument("identifier")
+
+    sp = sub.add_parser("profile", help="set friendly profile name")
+    sp.add_argument("identifier")
+    sp.add_argument("name")
+
+    sp = sub.add_parser("rm", aliases=["remove", "delete"], help="remove managed account")
+    sp.add_argument("identifier")
+    sp.add_argument("-y", "--yes", action="store_true")
+
+    sp = sub.add_parser("dir", help="map directory → account")
+    sp.add_argument("parts", nargs="+", metavar="ARG", help="[directory] <account>")
+
+    sub.add_parser("auto", help="switch based on cwd mapping")
+
+    sp = sub.add_parser("exec", help="run command as account (isolated GROK_HOME)")
+    sp.add_argument("identifier")
+    sp.add_argument("--dir", dest="dest", help="custom isolated dir path")
+    sp.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="command after optional --",
+    )
+
+    sp = sub.add_parser("config-dir", help="materialize isolated GROK_HOME and print export")
+    sp.add_argument("identifier")
+    sp.add_argument("dest", nargs="?", help="optional destination path")
+
+    sub.add_parser("check", help="verify backup integrity")
+    sub.add_parser("status", aliases=["current"], help="current account + token expiry")
+    sub.add_parser("stats", help="per-account usage statistics")
+    sub.add_parser("whoami", help="print active email")
+    sub.add_parser("version", help="print version")
+    sub.add_parser("help", help="show help")
+
+    sp = sub.add_parser("save", help="(legacy) add + optional profile")
+    sp.add_argument("name", nargs="?")
+    sp = sub.add_parser("use", aliases=["switch"], help="(legacy) → to")
+    sp.add_argument("name")
+    sp = sub.add_parser("rename", help="(legacy) rename profile")
+    sp.add_argument("old")
+    sp.add_argument("new")
+
+    return p
+
+
+def main(argv: list | None = None) -> None:
+    global DRY_RUN
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    DRY_RUN = bool(getattr(args, "dry_run", False))
+
+    cmd = args.cmd
+    if cmd is None:
+        cmd_ls(argparse.Namespace())
+        return
+    if cmd == "help":
+        cmd_help(parser)
+        return
+
+    handlers: dict[str, Any] = {
+        "add": cmd_add,
+        "ls": cmd_ls,
+        "list": cmd_ls,
+        "sw": cmd_sw,
+        "to": cmd_to,
+        "profile": cmd_profile,
+        "rm": cmd_rm,
+        "remove": cmd_rm,
+        "delete": cmd_rm,
+        "dir": cmd_dir,
+        "auto": cmd_auto,
+        "exec": cmd_exec,
+        "config-dir": cmd_config_dir,
+        "check": cmd_check,
+        "status": cmd_status,
+        "current": cmd_status,
+        "stats": cmd_stats,
+        "whoami": cmd_whoami,
+        "version": cmd_version,
+        "save": cmd_save_legacy,
+        "use": cmd_use_legacy,
+        "switch": cmd_use_legacy,
+        "rename": cmd_rename_legacy,
+    }
+    handler = handlers.get(cmd)
+    if not handler:
+        parser.print_help()
+        raise SystemExit(2)
+    handler(args)
+
+
+if __name__ == "__main__":
+    main()
